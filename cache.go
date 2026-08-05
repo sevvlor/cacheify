@@ -18,30 +18,34 @@ import (
 
 // Config configures the middleware.
 type Config struct {
-	Path                 string `json:"path" yaml:"path" toml:"path"`
-	MaxExpiry            int    `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
-	Cleanup              int    `json:"cleanup" yaml:"cleanup" toml:"cleanup"`
-	AddStatusHeader      bool   `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
-	QueryInKey           bool   `json:"queryInKey" yaml:"queryInKey" toml:"queryInKey"`
-	StripResponseCookies bool   `json:"stripResponseCookies" yaml:"stripResponseCookies" toml:"stripResponseCookies"`
-	MaxHeaderPairs       int    `json:"maxHeaderPairs" yaml:"maxHeaderPairs" toml:"maxHeaderPairs"`
-	MaxHeaderKeyLen      int    `json:"maxHeaderKeyLen" yaml:"maxHeaderKeyLen" toml:"maxHeaderKeyLen"`
-	MaxHeaderValueLen    int    `json:"maxHeaderValueLen" yaml:"maxHeaderValueLen" toml:"maxHeaderValueLen"`
-	UpdateTimeout        int    `json:"updateTimeout" yaml:"updateTimeout" toml:"updateTimeout"` // Seconds to wait for another request to complete cache update
+	Path                   string `json:"path" yaml:"path" toml:"path"`
+	MaxExpiry              int    `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
+	Cleanup                int    `json:"cleanup" yaml:"cleanup" toml:"cleanup"`
+	AddStatusHeader        bool   `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
+	QueryInKey             bool   `json:"queryInKey" yaml:"queryInKey" toml:"queryInKey"`
+	StripResponseCookies   bool   `json:"stripResponseCookies" yaml:"stripResponseCookies" toml:"stripResponseCookies"`
+	NoCacheOnSetCookie     bool   `json:"noCacheOnSetCookie" yaml:"noCacheOnSetCookie" toml:"noCacheOnSetCookie"`
+	NoCacheOnAuthorization bool   `json:"noCacheOnAuthorization" yaml:"noCacheOnAuthorization" toml:"noCacheOnAuthorization"`
+	MaxHeaderPairs         int    `json:"maxHeaderPairs" yaml:"maxHeaderPairs" toml:"maxHeaderPairs"`
+	MaxHeaderKeyLen        int    `json:"maxHeaderKeyLen" yaml:"maxHeaderKeyLen" toml:"maxHeaderKeyLen"`
+	MaxHeaderValueLen      int    `json:"maxHeaderValueLen" yaml:"maxHeaderValueLen" toml:"maxHeaderValueLen"`
+	UpdateTimeout          int    `json:"updateTimeout" yaml:"updateTimeout" toml:"updateTimeout"` // Seconds to wait for another request to complete cache update
 }
 
 // CreateConfig returns a config instance.
 func CreateConfig() *Config {
 	return &Config{
-		MaxExpiry:            int((5 * time.Minute).Seconds()),
-		Cleanup:              int((10 * time.Minute).Seconds()),
-		AddStatusHeader:      true,
-		QueryInKey:           true,
-		StripResponseCookies: true,
-		MaxHeaderPairs:       255,
-		MaxHeaderKeyLen:      100,
-		MaxHeaderValueLen:    8192,
-		UpdateTimeout:        30, // 30 seconds default timeout waiting for cache updates
+		MaxExpiry:              int((5 * time.Minute).Seconds()),
+		Cleanup:                int((10 * time.Minute).Seconds()),
+		AddStatusHeader:        true,
+		QueryInKey:             true,
+		StripResponseCookies:   true,
+		NoCacheOnSetCookie:     true,
+		NoCacheOnAuthorization: true,
+		MaxHeaderPairs:         255,
+		MaxHeaderKeyLen:        100,
+		MaxHeaderValueLen:      8192,
+		UpdateTimeout:          30, // 30 seconds default timeout waiting for cache updates
 	}
 }
 
@@ -59,6 +63,16 @@ type cache struct {
 	next  http.Handler
 }
 
+// Limits imposed by the on-disk metadata wire format (see marshalMetadata):
+// a 2-byte pair count, a 2-byte key length and a 3-byte value length.
+// Configuring a limit above these silently truncates on write, corrupting
+// the cache file, so we reject such configs at startup instead.
+const (
+	maxWireHeaderPairs    = 1<<16 - 1
+	maxWireHeaderKeyLen   = 1<<16 - 1
+	maxWireHeaderValueLen = 1<<24 - 1
+)
+
 // New returns a plugin instance.
 func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.Handler, error) {
 	if cfg.MaxExpiry <= 1 {
@@ -67,6 +81,18 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 
 	if cfg.Cleanup <= 1 {
 		return nil, errors.New("cleanup must be greater or equal to 1")
+	}
+
+	if cfg.MaxHeaderPairs > maxWireHeaderPairs {
+		return nil, fmt.Errorf("maxHeaderPairs must not exceed %d (on-disk format limit)", maxWireHeaderPairs)
+	}
+
+	if cfg.MaxHeaderKeyLen > maxWireHeaderKeyLen {
+		return nil, fmt.Errorf("maxHeaderKeyLen must not exceed %d (on-disk format limit)", maxWireHeaderKeyLen)
+	}
+
+	if cfg.MaxHeaderValueLen > maxWireHeaderValueLen {
+		return nil, fmt.Errorf("maxHeaderValueLen must not exceed %d (on-disk format limit)", maxWireHeaderValueLen)
 	}
 
 	fc, err := newFileCache(
@@ -103,6 +129,25 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// and the upgrade requires http.Hijacker support on the ResponseWriter
 	// which our responseWriter wrapper does not expose.
 	if r.Header.Get("Upgrade") != "" {
+		m.next.ServeHTTP(w, r)
+		return
+	}
+
+	// Bypass the cache entirely (both read AND write) for Authorization-bearing
+	// requests, matching Varnish's default vcl_recv "return (pass)" behaviour.
+	// This must happen before any cache lookup: a check inside cacheable()
+	// alone only stops an authenticated response from being *written* - an
+	// authenticated request could still receive a *hit* that an earlier,
+	// unauthenticated request for the same URL had already cached, since the
+	// cache key does not incorporate Authorization. That would silently serve
+	// the wrong (generic/anonymous) content to an authenticated caller. Doing
+	// the bypass here also avoids needlessly serialising concurrent
+	// Authorization-bearing requests through the update-intent machinery,
+	// since none of them will ever be cached anyway.
+	if m.cfg.NoCacheOnAuthorization && r.Header.Get("Authorization") != "" {
+		if m.cfg.AddStatusHeader {
+			w.Header().Set(cacheHeader, cacheMissStatus)
+		}
 		m.next.ServeHTTP(w, r)
 		return
 	}
@@ -217,7 +262,58 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.next.ServeHTTP(rw, r)
 }
 
+// varySafelist lists request headers that are safe for us to ignore when
+// deciding cacheability. Varying a response by these headers only affects
+// presentation/encoding, never per-user/per-session content.
+var varySafelist = map[string]bool{
+	"accept-encoding": true,
+	"accept-language": true,
+}
+
+// varyIsCacheable reports whether every header named in the response's Vary
+// header(s) is on the safelist. Our cache key does not incorporate any
+// request headers, so a Vary naming anything else (Cookie, Authorization,
+// Accept, ...) - or "Vary: *" - means the response legitimately differs
+// per client/session in a way we cannot key on. Caching it would mean
+// serving one user's variant to everyone else matching the same URL.
+func varyIsCacheable(w http.ResponseWriter) bool {
+	for _, vary := range w.Header().Values("Vary") {
+		for _, field := range strings.Split(vary, ",") {
+			field = strings.ToLower(strings.TrimSpace(field))
+			if field == "" {
+				continue
+			}
+			if field == "*" || !varySafelist[field] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (time.Duration, bool) {
+	// Varnish-style behaviour: a Set-Cookie header almost always means a
+	// per-client/per-session response. Treat its mere presence as an
+	// unconditional "do not cache", regardless of what Cache-Control says,
+	// since origins frequently forget to mark such responses private/no-store.
+	if m.cfg.NoCacheOnSetCookie && len(w.Header().Values("Set-Cookie")) > 0 {
+		return 0, false
+	}
+
+	// NoCacheOnAuthorization is enforced as a full read+write bypass in
+	// ServeHTTP, before a cache lookup even happens - see the comment there.
+	// By the time cacheable() runs (only reachable on a cache miss), an
+	// Authorization-bearing request has therefore already been routed
+	// straight to the backend when the option is enabled, so no check is
+	// needed here. When the option is disabled, RFC 7234 §3.2's
+	// Authorization-request handling in the cachecontrol library below
+	// still applies (Cache-Control: public/must-revalidate/s-maxage
+	// re-enables caching, matching Varnish's default).
+
+	if !varyIsCacheable(w) {
+		return 0, false
+	}
+
 	reasons, expireBy, err := cachecontrol.CachableResponseWriter(r, status, w, cachecontrol.Options{})
 	if err != nil || len(reasons) > 0 {
 		return 0, false
@@ -245,9 +341,13 @@ func cacheKey(r *http.Request, includeQuery bool) string {
 	// Pre-allocate approximate capacity
 	b.Grow(len(r.Method) + len(r.Host) + len(r.URL.Path) + len(r.URL.RawQuery) + 10)
 
-	// Base key with method, host and path
+	// Base key with method, host and path. NUL-separated so that e.g. a
+	// method "GETX" + host "ample.com" can never collide with method "GET"
+	// + host "Xample.com" once concatenated.
 	b.WriteString(r.Method)
-	b.WriteString(r.Host)
+	b.WriteByte(0)
+	b.WriteString(strings.ToLower(r.Host))
+	b.WriteByte(0)
 	b.WriteString(r.URL.Path)
 
 	// Handle query parameters in a sorted, consistent way
@@ -316,7 +416,10 @@ func (rw *responseWriter) WriteHeader(s int) {
 	expiry, cacheable := rw.checkCacheable(rw.request, rw.ResponseWriter, s)
 
 	if cacheable {
-		// Strip Set-Cookie headers if configured (affects both cache and response)
+		// Strip Set-Cookie headers if configured (affects both cache and response).
+		// With the default NoCacheOnSetCookie=true, responses carrying Set-Cookie
+		// never reach this branch at all, so this mainly matters for deployments
+		// that explicitly disable NoCacheOnSetCookie.
 		if rw.config.StripResponseCookies {
 			rw.ResponseWriter.Header().Del("Set-Cookie")
 		}

@@ -41,6 +41,21 @@ func TestNew(t *testing.T) {
 			cfg:     &Config{Path: os.TempDir(), MaxExpiry: 300, Cleanup: 600},
 			wantErr: false,
 		},
+		{
+			name:    "should error if maxHeaderPairs exceeds the on-disk format limit",
+			cfg:     &Config{Path: os.TempDir(), MaxExpiry: 300, Cleanup: 600, MaxHeaderPairs: maxWireHeaderPairs + 1},
+			wantErr: true,
+		},
+		{
+			name:    "should error if maxHeaderKeyLen exceeds the on-disk format limit",
+			cfg:     &Config{Path: os.TempDir(), MaxExpiry: 300, Cleanup: 600, MaxHeaderKeyLen: maxWireHeaderKeyLen + 1},
+			wantErr: true,
+		},
+		{
+			name:    "should error if maxHeaderValueLen exceeds the on-disk format limit",
+			cfg:     &Config{Path: os.TempDir(), MaxExpiry: 300, Cleanup: 600, MaxHeaderValueLen: maxWireHeaderValueLen + 1},
+			wantErr: true,
+		},
 	}
 
 	for _, test := range tests {
@@ -84,6 +99,262 @@ func TestCache_ServeHTTP(t *testing.T) {
 
 	if state := rw.Header().Get("Cache-Status"); state != "hit" {
 		t.Errorf("unexpected cache state: want \"hit\", got: %q", state)
+	}
+}
+
+func TestCache_NoCacheOnSetCookie(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "max-age=20")
+		rw.Header().Set("Set-Cookie", "XSRF-TOKEN=deadbeef; Path=/; Secure; SameSite=Strict")
+		rw.WriteHeader(http.StatusOK)
+	}
+
+	cfg := &Config{
+		Path:               dir,
+		MaxExpiry:          10,
+		Cleanup:            20,
+		AddStatusHeader:    true,
+		NoCacheOnSetCookie: true,
+		MaxHeaderPairs:     5,
+		MaxHeaderKeyLen:    30,
+		MaxHeaderValueLen:  200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/session", nil)
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+
+		if state := rw.Header().Get("Cache-Status"); state != "miss" {
+			t.Errorf("request %d: unexpected cache state: want \"miss\" (Set-Cookie must never be cached), got: %q", i, state)
+		}
+
+		if got := rw.Header().Get("Set-Cookie"); got == "" {
+			t.Errorf("request %d: expected Set-Cookie to be delivered to the client, got none", i)
+		}
+	}
+}
+
+func TestCache_NoCacheOnAuthorization(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		// Cache-Control: public is exactly the override RFC 7234 §3.2 grants
+		// for Authorization-bearing requests - the case noCacheOnAuthorization
+		// exists to block by default.
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.WriteHeader(http.StatusOK)
+	}
+
+	cfg := &Config{
+		Path:                   dir,
+		MaxExpiry:              10,
+		Cleanup:                20,
+		AddStatusHeader:        true,
+		NoCacheOnAuthorization: true,
+		MaxHeaderPairs:         5,
+		MaxHeaderKeyLen:        30,
+		MaxHeaderValueLen:      200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/api/me", nil)
+	req.Header.Set("Authorization", "Bearer user-a-token")
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+
+		if state := rw.Header().Get("Cache-Status"); state != "miss" {
+			t.Errorf("request %d: unexpected cache state: want \"miss\" (Authorization requests must never be cached), got: %q", i, state)
+		}
+	}
+}
+
+func TestCache_AuthorizationCacheableWhenDisabled(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.WriteHeader(http.StatusOK)
+	}
+
+	cfg := &Config{
+		Path:                   dir,
+		MaxExpiry:              10,
+		Cleanup:                20,
+		AddStatusHeader:        true,
+		NoCacheOnAuthorization: false,
+		MaxHeaderPairs:         5,
+		MaxHeaderKeyLen:        30,
+		MaxHeaderValueLen:      200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/api/public-leaderboard", nil)
+	req.Header.Set("Authorization", "Bearer some-token")
+
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, req)
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Fatalf("first request: unexpected cache state: want \"miss\", got: %q", state)
+	}
+
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, req)
+	if state := rw.Header().Get("Cache-Status"); state != "hit" {
+		t.Errorf("expected second request to be a cache hit when noCacheOnAuthorization is disabled and Cache-Control: public is set, got: %q", state)
+	}
+}
+
+// TestCache_AuthorizationNeverServedFromAnonymousHit guards against a bug where
+// NoCacheOnAuthorization only blocked *writing* an Authorization-bearing
+// response to the cache. Because the cache key never includes the
+// Authorization header, an earlier anonymous request could populate the
+// cache for a URL, and a later Authorization-bearing request for that same
+// URL would then receive that stale anonymous hit directly from GetStream -
+// without ever reaching the write-time check, and without the backend ever
+// seeing the authenticated request at all.
+func TestCache_AuthorizationNeverServedFromAnonymousHit(t *testing.T) {
+	dir := createTempDir(t)
+
+	var backendCalls []string
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		auth := req.Header.Get("Authorization")
+		backendCalls = append(backendCalls, auth)
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		_, _ = rw.Write([]byte("response-for:" + auth))
+	}
+
+	cfg := &Config{
+		Path:                   dir,
+		MaxExpiry:              10,
+		Cleanup:                20,
+		AddStatusHeader:        true,
+		NoCacheOnAuthorization: true,
+		MaxHeaderPairs:         5,
+		MaxHeaderKeyLen:        30,
+		MaxHeaderValueLen:      200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	anonReq := httptest.NewRequest(http.MethodGet, "http://localhost/shared-url", nil)
+
+	// Anonymous request populates the cache.
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, anonReq)
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Fatalf("anonymous request 1: want \"miss\", got: %q", state)
+	}
+
+	// A second anonymous request confirms it's actually cached.
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, anonReq)
+	if state := rw.Header().Get("Cache-Status"); state != "hit" {
+		t.Fatalf("anonymous request 2: want \"hit\", got: %q", state)
+	}
+
+	// An authenticated request to the SAME URL must bypass the cache
+	// entirely - it must never receive the anonymous cached body, and the
+	// backend must see it.
+	authReq := httptest.NewRequest(http.MethodGet, "http://localhost/shared-url", nil)
+	authReq.Header.Set("Authorization", "Bearer secret-token")
+
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, authReq)
+
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Errorf("authenticated request: want \"miss\" (must bypass cache), got: %q", state)
+	}
+	if got, want := rw.Body.String(), "response-for:Bearer secret-token"; got != want {
+		t.Errorf("authenticated request got the stale anonymous cached response instead of its own: got %q, want %q", got, want)
+	}
+	if len(backendCalls) != 2 || backendCalls[1] != "Bearer secret-token" {
+		t.Errorf("expected backend to be called for the authenticated request, backend calls: %v", backendCalls)
+	}
+}
+
+func TestCache_VaryHandling(t *testing.T) {
+	tests := []struct {
+		name      string
+		varyValue string
+		wantCache bool
+	}{
+		{name: "no Vary header", varyValue: "", wantCache: true},
+		{name: "Vary: Accept-Encoding is safelisted", varyValue: "Accept-Encoding", wantCache: true},
+		{name: "Vary: Accept-Encoding, Accept-Language is safelisted", varyValue: "Accept-Encoding, Accept-Language", wantCache: true},
+		{name: "Vary: Cookie must not be cached", varyValue: "Cookie", wantCache: false},
+		{name: "Vary: Authorization must not be cached", varyValue: "Authorization", wantCache: false},
+		{name: "Vary: * must never be cached", varyValue: "*", wantCache: false},
+		{name: "mixed safelisted and unsafe still blocks caching", varyValue: "Accept-Encoding, Cookie", wantCache: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := createTempDir(t)
+
+			next := func(rw http.ResponseWriter, req *http.Request) {
+				rw.Header().Set("Cache-Control", "max-age=20")
+				if test.varyValue != "" {
+					rw.Header().Set("Vary", test.varyValue)
+				}
+				rw.WriteHeader(http.StatusOK)
+			}
+
+			cfg := &Config{
+				Path:              dir,
+				MaxExpiry:         10,
+				Cleanup:           20,
+				AddStatusHeader:   true,
+				MaxHeaderPairs:    5,
+				MaxHeaderKeyLen:   30,
+				MaxHeaderValueLen: 200,
+			}
+
+			c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "http://localhost/vary-test", nil)
+
+			rw := httptest.NewRecorder()
+			c.ServeHTTP(rw, req)
+			if state := rw.Header().Get("Cache-Status"); state != "miss" {
+				t.Fatalf("first request: unexpected cache state: want \"miss\", got: %q", state)
+			}
+
+			rw = httptest.NewRecorder()
+			c.ServeHTTP(rw, req)
+
+			state := rw.Header().Get("Cache-Status")
+			if test.wantCache && state != "hit" {
+				t.Errorf("expected second request to be a cache hit, got: %q", state)
+			}
+			if !test.wantCache && state != "miss" {
+				t.Errorf("expected second request to bypass the cache, got: %q", state)
+			}
+		})
 	}
 }
 
