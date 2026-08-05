@@ -1,4 +1,4 @@
-module github.com/ciaranj/cacheify
+module github.com/sevvlor/cacheify
 
 go 1.24
 
