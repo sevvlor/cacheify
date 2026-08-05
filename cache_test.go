@@ -143,6 +143,86 @@ func TestCache_NoCacheOnSetCookie(t *testing.T) {
 	}
 }
 
+func TestCache_NoCacheOnAuthorization(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		// Cache-Control: public is exactly the override RFC 7234 §3.2 grants
+		// for Authorization-bearing requests - the case noCacheOnAuthorization
+		// exists to block by default.
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.WriteHeader(http.StatusOK)
+	}
+
+	cfg := &Config{
+		Path:                   dir,
+		MaxExpiry:              10,
+		Cleanup:                20,
+		AddStatusHeader:        true,
+		NoCacheOnAuthorization: true,
+		MaxHeaderPairs:         5,
+		MaxHeaderKeyLen:        30,
+		MaxHeaderValueLen:      200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/api/me", nil)
+	req.Header.Set("Authorization", "Bearer user-a-token")
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+
+		if state := rw.Header().Get("Cache-Status"); state != "miss" {
+			t.Errorf("request %d: unexpected cache state: want \"miss\" (Authorization requests must never be cached), got: %q", i, state)
+		}
+	}
+}
+
+func TestCache_AuthorizationCacheableWhenDisabled(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.WriteHeader(http.StatusOK)
+	}
+
+	cfg := &Config{
+		Path:                   dir,
+		MaxExpiry:              10,
+		Cleanup:                20,
+		AddStatusHeader:        true,
+		NoCacheOnAuthorization: false,
+		MaxHeaderPairs:         5,
+		MaxHeaderKeyLen:        30,
+		MaxHeaderValueLen:      200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/api/public-leaderboard", nil)
+	req.Header.Set("Authorization", "Bearer some-token")
+
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, req)
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Fatalf("first request: unexpected cache state: want \"miss\", got: %q", state)
+	}
+
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, req)
+	if state := rw.Header().Get("Cache-Status"); state != "hit" {
+		t.Errorf("expected second request to be a cache hit when noCacheOnAuthorization is disabled and Cache-Control: public is set, got: %q", state)
+	}
+}
+
 func TestCache_VaryHandling(t *testing.T) {
 	tests := []struct {
 		name      string

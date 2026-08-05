@@ -18,32 +18,34 @@ import (
 
 // Config configures the middleware.
 type Config struct {
-	Path                 string `json:"path" yaml:"path" toml:"path"`
-	MaxExpiry            int    `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
-	Cleanup              int    `json:"cleanup" yaml:"cleanup" toml:"cleanup"`
-	AddStatusHeader      bool   `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
-	QueryInKey           bool   `json:"queryInKey" yaml:"queryInKey" toml:"queryInKey"`
-	StripResponseCookies bool   `json:"stripResponseCookies" yaml:"stripResponseCookies" toml:"stripResponseCookies"`
-	NoCacheOnSetCookie   bool   `json:"noCacheOnSetCookie" yaml:"noCacheOnSetCookie" toml:"noCacheOnSetCookie"`
-	MaxHeaderPairs       int    `json:"maxHeaderPairs" yaml:"maxHeaderPairs" toml:"maxHeaderPairs"`
-	MaxHeaderKeyLen      int    `json:"maxHeaderKeyLen" yaml:"maxHeaderKeyLen" toml:"maxHeaderKeyLen"`
-	MaxHeaderValueLen    int    `json:"maxHeaderValueLen" yaml:"maxHeaderValueLen" toml:"maxHeaderValueLen"`
-	UpdateTimeout        int    `json:"updateTimeout" yaml:"updateTimeout" toml:"updateTimeout"` // Seconds to wait for another request to complete cache update
+	Path                   string `json:"path" yaml:"path" toml:"path"`
+	MaxExpiry              int    `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
+	Cleanup                int    `json:"cleanup" yaml:"cleanup" toml:"cleanup"`
+	AddStatusHeader        bool   `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
+	QueryInKey             bool   `json:"queryInKey" yaml:"queryInKey" toml:"queryInKey"`
+	StripResponseCookies   bool   `json:"stripResponseCookies" yaml:"stripResponseCookies" toml:"stripResponseCookies"`
+	NoCacheOnSetCookie     bool   `json:"noCacheOnSetCookie" yaml:"noCacheOnSetCookie" toml:"noCacheOnSetCookie"`
+	NoCacheOnAuthorization bool   `json:"noCacheOnAuthorization" yaml:"noCacheOnAuthorization" toml:"noCacheOnAuthorization"`
+	MaxHeaderPairs         int    `json:"maxHeaderPairs" yaml:"maxHeaderPairs" toml:"maxHeaderPairs"`
+	MaxHeaderKeyLen        int    `json:"maxHeaderKeyLen" yaml:"maxHeaderKeyLen" toml:"maxHeaderKeyLen"`
+	MaxHeaderValueLen      int    `json:"maxHeaderValueLen" yaml:"maxHeaderValueLen" toml:"maxHeaderValueLen"`
+	UpdateTimeout          int    `json:"updateTimeout" yaml:"updateTimeout" toml:"updateTimeout"` // Seconds to wait for another request to complete cache update
 }
 
 // CreateConfig returns a config instance.
 func CreateConfig() *Config {
 	return &Config{
-		MaxExpiry:            int((5 * time.Minute).Seconds()),
-		Cleanup:              int((10 * time.Minute).Seconds()),
-		AddStatusHeader:      true,
-		QueryInKey:           true,
-		StripResponseCookies: true,
-		NoCacheOnSetCookie:   true,
-		MaxHeaderPairs:       255,
-		MaxHeaderKeyLen:      100,
-		MaxHeaderValueLen:    8192,
-		UpdateTimeout:        30, // 30 seconds default timeout waiting for cache updates
+		MaxExpiry:              int((5 * time.Minute).Seconds()),
+		Cleanup:                int((10 * time.Minute).Seconds()),
+		AddStatusHeader:        true,
+		QueryInKey:             true,
+		StripResponseCookies:   true,
+		NoCacheOnSetCookie:     true,
+		NoCacheOnAuthorization: true,
+		MaxHeaderPairs:         255,
+		MaxHeaderKeyLen:        100,
+		MaxHeaderValueLen:      8192,
+		UpdateTimeout:          30, // 30 seconds default timeout waiting for cache updates
 	}
 }
 
@@ -276,6 +278,18 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 	// unconditional "do not cache", regardless of what Cache-Control says,
 	// since origins frequently forget to mark such responses private/no-store.
 	if m.cfg.NoCacheOnSetCookie && len(w.Header().Values("Set-Cookie")) > 0 {
+		return 0, false
+	}
+
+	// RFC 7234 §3.2 lets a response explicitly re-enable caching of an
+	// Authorization-bearing request via Cache-Control: public/must-revalidate/
+	// s-maxage - the underlying cachecontrol library honours that override.
+	// That is spec-compliant (and matches Varnish's default), but origins
+	// frequently set "public" meaning just "cacheable" without realising it
+	// also overrides this protection - which can leak one bearer token's
+	// response body to a request carrying a different (or no) token at the
+	// same URL. Block it unconditionally unless explicitly disabled.
+	if m.cfg.NoCacheOnAuthorization && r.Header.Get("Authorization") != "" {
 		return 0, false
 	}
 

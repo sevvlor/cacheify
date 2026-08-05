@@ -101,6 +101,11 @@ If true (the default) cacheify will remove any 'Set-Cookie' headers from any cac
 
 If true (the default), any response carrying a `Set-Cookie` header is treated as unconditionally non-cacheable, regardless of its `Cache-Control` headers - matching Varnish's default `hit_for_pass` behaviour for `Set-Cookie` responses. This exists because origins frequently forget to mark per-session/personalized responses as `private`/`no-store`, and a shared cache that only trusts `Cache-Control` can end up serving one user's cookie-bearing response (and its body) to another user. Disable this only if you are certain every route behind this middleware sets `Cache-Control` correctly for personalized content.
 
+#### No Cache On Authorization (`noCacheOnAuthorization`)
+*Default: true*
+
+If true (the default), any request carrying an `Authorization` header is treated as unconditionally non-cacheable. RFC 7234 §3.2 (and the underlying `cachecontrol` library) normally allows an origin to override this by sending `Cache-Control: public`, `must-revalidate`, or `s-maxage` on the response - matching Varnish's default behaviour. That override is easy to trigger by accident: an origin that sets `Cache-Control: public` meaning simply "this may be cached" can unintentionally let one bearer token's response body be served to a request carrying a different (or no) token at the same URL. Disable this only if you deliberately rely on that override for a route that is genuinely token-agnostic (e.g. a public endpoint that merely accepts an optional `Authorization` header).
+
 #### Vary Handling
 
 Cacheify's cache key does not incorporate any request headers, so a response whose `Vary` header names anything other than `Accept-Encoding` or `Accept-Language` (or is `Vary: *`) is treated as non-cacheable, regardless of `Cache-Control`. This prevents serving one client's `Vary: Cookie`/`Vary: Authorization` variant to every other client requesting the same URL. This is not currently configurable.
@@ -109,6 +114,10 @@ Cacheify's cache key does not incorporate any request headers, so a response who
 *Default: 30*
 
 The number of seconds to wait for another request to complete a cache update before timing out and fetching from upstream independently. This prevents requests from waiting indefinitely if an upstream server hangs during a cache miss. When multiple requests arrive for the same uncached resource, the first request fetches from upstream while subsequent requests wait for completion. If the timeout is exceeded, waiting requests will proceed to fetch from upstream themselves rather than block indefinitely.
+
+## Upgrading onto an existing cache directory
+
+Cacheability decisions (`noCacheOnSetCookie`, `noCacheOnAuthorization`, Vary handling) are only applied to *new* writes. There is no cache invalidation/purge mechanism in this plugin - entries already on disk from a previous version keep being served as cache hits until their own stored TTL expires, regardless of what the current code would have decided. If you are upgrading a deployment that was previously running without these protections, delete the contents of the configured `path` once as part of the rollout so no pre-hardening entries linger.
 
 ## Release History
 ### v1.0.0
