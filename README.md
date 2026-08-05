@@ -25,7 +25,7 @@ Static:
 
 ```toml
 [experimental.plugins.cache]
-  modulename = "github.com/ciaranj/cacheify"
+  modulename = "github.com/sevvlor/cacheify"
   version = "v0.0.1"
 ```
 
