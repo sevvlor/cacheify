@@ -108,6 +108,11 @@ If true (the default), any response carrying a `Set-Cookie` header is treated as
 
 If true (the default), any request carrying an `Authorization` header is treated as unconditionally non-cacheable. RFC 7234 §3.2 (and the underlying `cachecontrol` library) normally allows an origin to override this by sending `Cache-Control: public`, `must-revalidate`, or `s-maxage` on the response - matching Varnish's default behaviour. That override is easy to trigger by accident: an origin that sets `Cache-Control: public` meaning simply "this may be cached" can unintentionally let one bearer token's response body be served to a request carrying a different (or no) token at the same URL. Disable this only if you deliberately rely on that override for a route that is genuinely token-agnostic (e.g. a public endpoint that merely accepts an optional `Authorization` header).
 
+#### No Heuristic Caching (`noHeuristicCaching`)
+*Default: true*
+
+RFC 7234 §4.2.2 allows a cache to store a response with no explicit freshness signal at all (no `Cache-Control: max-age`/`s-maxage`/`public`, no `Expires`) for certain status codes, using a heuristic lifetime. This plugin's heuristic is simply "apply `maxExpiry`" - it does not distinguish between a static asset that forgot to set headers and an ordinary dynamic endpoint (e.g. a JSON API route) that never made a caching decision at all, because there was never a cache in front of it before. If true (the default), such headerless responses are never cached - only an explicit `Cache-Control`/`Expires` (or a `public` override) causes caching. Disable this only if you specifically want the pre-hardening behaviour of caching anything with a heuristically-cacheable status code by default.
+
 #### Vary Handling
 
 Cacheify's cache key does not incorporate any request headers, so a response whose `Vary` header names anything other than `Accept-Encoding` or `Accept-Language` (or is `Vary: *`) is treated as non-cacheable, regardless of `Cache-Control`. This prevents serving one client's `Vary: Cookie`/`Vary: Authorization` variant to every other client requesting the same URL. This is not currently configurable.

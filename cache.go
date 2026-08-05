@@ -26,6 +26,7 @@ type Config struct {
 	StripResponseCookies   bool   `json:"stripResponseCookies" yaml:"stripResponseCookies" toml:"stripResponseCookies"`
 	NoCacheOnSetCookie     bool   `json:"noCacheOnSetCookie" yaml:"noCacheOnSetCookie" toml:"noCacheOnSetCookie"`
 	NoCacheOnAuthorization bool   `json:"noCacheOnAuthorization" yaml:"noCacheOnAuthorization" toml:"noCacheOnAuthorization"`
+	NoHeuristicCaching     bool   `json:"noHeuristicCaching" yaml:"noHeuristicCaching" toml:"noHeuristicCaching"`
 	MaxHeaderPairs         int    `json:"maxHeaderPairs" yaml:"maxHeaderPairs" toml:"maxHeaderPairs"`
 	MaxHeaderKeyLen        int    `json:"maxHeaderKeyLen" yaml:"maxHeaderKeyLen" toml:"maxHeaderKeyLen"`
 	MaxHeaderValueLen      int    `json:"maxHeaderValueLen" yaml:"maxHeaderValueLen" toml:"maxHeaderValueLen"`
@@ -42,6 +43,7 @@ func CreateConfig() *Config {
 		StripResponseCookies:   true,
 		NoCacheOnSetCookie:     true,
 		NoCacheOnAuthorization: true,
+		NoHeuristicCaching:     true,
 		MaxHeaderPairs:         255,
 		MaxHeaderKeyLen:        100,
 		MaxHeaderValueLen:      8192,
@@ -129,6 +131,22 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// and the upgrade requires http.Hijacker support on the ResponseWriter
 	// which our responseWriter wrapper does not expose.
 	if r.Header.Get("Upgrade") != "" {
+		m.next.ServeHTTP(w, r)
+		return
+	}
+
+	// Bypass the cache entirely (both read AND write) for Range requests.
+	// This plugin has no support for serving byte-range slices out of a
+	// cached entry, nor for storing per-range variants of a resource. Without
+	// this, a Range request could populate the cache with a 206 Partial
+	// Content body that a later, full request would then receive verbatim
+	// (truncated/wrong content, served as if it were the complete resource),
+	// or an existing full 200 entry could be served back to a Range request
+	// while completely ignoring the requested range.
+	if r.Header.Get("Range") != "" {
+		if m.cfg.AddStatusHeader {
+			w.Header().Set(cacheHeader, cacheMissStatus)
+		}
 		m.next.ServeHTTP(w, r)
 		return
 	}
@@ -292,6 +310,26 @@ func varyIsCacheable(w http.ResponseWriter) bool {
 }
 
 func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (time.Duration, bool) {
+	// This plugin always replays a cached entry's stored status/body verbatim
+	// to every subsequent request, regardless of that request's own
+	// Range/If-None-Match/If-Modified-Since headers. The underlying
+	// cachecontrol library treats both of these as cacheable by default
+	// (206 is explicitly RFC-listed as heuristically cacheable; 304 becomes
+	// cacheable whenever the origin also sends an explicit Cache-Control,
+	// which is a common, spec-compliant pattern for revalidation responses).
+	// Caching either would let one client's Range or conditional request
+	// poison the cache for every other client requesting the same URL: a
+	// 206 stores only a byte-slice that a later full request would then
+	// receive as if it were the complete body, and a 304 stores an empty
+	// body that a later request with no conditional headers would receive
+	// as if it were the full resource. Block both unconditionally - a
+	// Range request is also bypassed entirely in ServeHTTP before this is
+	// ever reached, but 304 has no equivalent request-side signal to bypass
+	// on, so it must be caught here instead.
+	if status == http.StatusPartialContent || status == http.StatusNotModified {
+		return 0, false
+	}
+
 	// Varnish-style behaviour: a Set-Cookie header almost always means a
 	// per-client/per-session response. Treat its mere presence as an
 	// unconditional "do not cache", regardless of what Cache-Control says,
@@ -320,7 +358,21 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 	}
 
 	if expireBy.IsZero() {
-		// No explicit expiration - apply default max expiry
+		// No explicit expiration signal (no Cache-Control max-age/s-maxage,
+		// no Public directive, no Expires header) - the response only ended
+		// up here because its status code is heuristically cacheable by
+		// default per RFC 7234 §4.2.2. That default exists for caches that
+		// implement heuristic freshness properly (e.g. deriving a lifetime
+		// from Last-Modified); this plugin instead just applies the flat
+		// MaxExpiry ceiling to anything, including responses whose origin
+		// never made any caching decision at all - i.e. ordinary dynamic
+		// endpoints that simply forgot to set Cache-Control: no-store. With
+		// NoHeuristicCaching enabled, require an explicit signal instead of
+		// guessing.
+		if m.cfg.NoHeuristicCaching {
+			return 0, false
+		}
+
 		return time.Duration(m.cfg.MaxExpiry) * time.Second, true
 	}
 

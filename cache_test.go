@@ -294,6 +294,309 @@ func TestCache_AuthorizationNeverServedFromAnonymousHit(t *testing.T) {
 	}
 }
 
+// TestCache_RangeRequestBypassesCache guards against a Range request ever
+// populating or reading the cache: this plugin has no support for storing or
+// replaying byte-range slices, so a Range request must always reach the
+// backend directly and must never be cached.
+func TestCache_RangeRequestBypassesCache(t *testing.T) {
+	dir := createTempDir(t)
+
+	var backendCalls int
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		backendCalls++
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.Header().Set("Accept-Ranges", "bytes")
+		if req.Header.Get("Range") != "" {
+			rw.Header().Set("Content-Range", "bytes 0-3/10")
+			rw.WriteHeader(http.StatusPartialContent)
+			_, _ = rw.Write([]byte("0123"))
+			return
+		}
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("0123456789"))
+	}
+
+	cfg := &Config{
+		Path:              dir,
+		MaxExpiry:         10,
+		Cleanup:           20,
+		AddStatusHeader:   true,
+		MaxHeaderPairs:    5,
+		MaxHeaderKeyLen:   30,
+		MaxHeaderValueLen: 200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rangeReq := httptest.NewRequest(http.MethodGet, "http://localhost/big-file", nil)
+	rangeReq.Header.Set("Range", "bytes=0-3")
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, rangeReq)
+
+		if state := rw.Header().Get("Cache-Status"); state != "miss" {
+			t.Errorf("range request %d: want \"miss\" (must bypass cache), got: %q", i, state)
+		}
+		if rw.Code != http.StatusPartialContent {
+			t.Errorf("range request %d: want status 206, got: %d", i, rw.Code)
+		}
+	}
+	if backendCalls != 2 {
+		t.Errorf("expected backend to be called for every range request, got %d calls", backendCalls)
+	}
+
+	// A normal, full request for the same URL must get the complete body,
+	// never the partial slice from the range requests above.
+	fullReq := httptest.NewRequest(http.MethodGet, "http://localhost/big-file", nil)
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, fullReq)
+
+	if got, want := rw.Body.String(), "0123456789"; got != want {
+		t.Errorf("full request got wrong body: got %q, want %q", got, want)
+	}
+	if rw.Code != http.StatusOK {
+		t.Errorf("full request: want status 200, got: %d", rw.Code)
+	}
+}
+
+// TestCache_PartialContentNeverCached guards against a 206 response ever
+// being stored, even if Cache-Control would otherwise allow it: a later,
+// full (non-Range) request must never receive a previously cached partial
+// body.
+func TestCache_PartialContentNeverCached(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.Header().Set("Content-Range", "bytes 0-3/10")
+		rw.WriteHeader(http.StatusPartialContent)
+		_, _ = rw.Write([]byte("0123"))
+	}
+
+	cfg := &Config{
+		Path:              dir,
+		MaxExpiry:         10,
+		Cleanup:           20,
+		AddStatusHeader:   true,
+		MaxHeaderPairs:    5,
+		MaxHeaderKeyLen:   30,
+		MaxHeaderValueLen: 200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No Range header at all here - simulates a backend that returns 206
+	// independently of what was requested (or a proxy quirk). Even so, this
+	// must never be cached.
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/oddball", nil)
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+		if state := rw.Header().Get("Cache-Status"); state != "miss" {
+			t.Errorf("request %d: want \"miss\" (206 must never be cached), got: %q", i, state)
+		}
+	}
+}
+
+// TestCache_NotModifiedNeverCached guards against the cache-poisoning
+// scenario where a conditional request's 304 (empty body) response gets
+// stored and then served to a later, unconditional request as if it were
+// the full resource.
+func TestCache_NotModifiedNeverCached(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("If-None-Match") != "" {
+			// A common, spec-compliant pattern: refresh freshness via
+			// Cache-Control on the 304 itself.
+			rw.Header().Set("Cache-Control", "public, max-age=20")
+			rw.Header().Set("Etag", `"abc123"`)
+			rw.WriteHeader(http.StatusNotModified)
+			return
+		}
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.Header().Set("Etag", `"abc123"`)
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("the real content"))
+	}
+
+	cfg := &Config{
+		Path:              dir,
+		MaxExpiry:         10,
+		Cleanup:           20,
+		AddStatusHeader:   true,
+		MaxHeaderPairs:    5,
+		MaxHeaderKeyLen:   30,
+		MaxHeaderValueLen: 200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A conditional request that gets a 304 back - this must not poison the
+	// cache for subsequent unconditional requests.
+	conditionalReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.js", nil)
+	conditionalReq.Header.Set("If-None-Match", `"abc123"`)
+
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, conditionalReq)
+	if rw.Code != http.StatusNotModified {
+		t.Fatalf("conditional request: want status 304, got: %d", rw.Code)
+	}
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Errorf("conditional request: want \"miss\" (304 must never be cached), got: %q", state)
+	}
+
+	// A normal, unconditional request for the same URL must get the real,
+	// full content - never an empty body from the 304 above.
+	plainReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.js", nil)
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, plainReq)
+
+	if rw.Code != http.StatusOK {
+		t.Errorf("unconditional request: want status 200, got: %d", rw.Code)
+	}
+	if got, want := rw.Body.String(), "the real content"; got != want {
+		t.Errorf("unconditional request got wrong body: got %q, want %q", got, want)
+	}
+}
+
+// TestCache_NoHeuristicCaching guards a response with no Cache-Control,
+// Expires, or Public directive at all - e.g. an ordinary dynamic JSON API
+// endpoint that never made any caching decision - is never cached when
+// NoHeuristicCaching is enabled, even though its status code (200) is
+// heuristically cacheable by default per RFC 7234 §4.2.2.
+func TestCache_NoHeuristicCaching(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte(`{"some":"data"}`))
+	}
+
+	cfg := &Config{
+		Path:               dir,
+		MaxExpiry:          10,
+		Cleanup:            20,
+		AddStatusHeader:    true,
+		NoHeuristicCaching: true,
+		MaxHeaderPairs:     5,
+		MaxHeaderKeyLen:    30,
+		MaxHeaderValueLen:  200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/api/data", nil)
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+		if state := rw.Header().Get("Cache-Status"); state != "miss" {
+			t.Errorf("request %d: want \"miss\" (headerless response must never be cached), got: %q", i, state)
+		}
+	}
+}
+
+// TestCache_HeuristicCachingWhenDisabled confirms disabling NoHeuristicCaching
+// restores the pre-hardening v1.0.0 behaviour of caching a headerless
+// response using MaxExpiry as its heuristic lifetime.
+func TestCache_HeuristicCachingWhenDisabled(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("no headers at all"))
+	}
+
+	cfg := &Config{
+		Path:               dir,
+		MaxExpiry:          10,
+		Cleanup:            20,
+		AddStatusHeader:    true,
+		NoHeuristicCaching: false,
+		MaxHeaderPairs:     5,
+		MaxHeaderKeyLen:    30,
+		MaxHeaderValueLen:  200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/legacy", nil)
+
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, req)
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Fatalf("first request: want \"miss\", got: %q", state)
+	}
+
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, req)
+	if state := rw.Header().Get("Cache-Status"); state != "hit" {
+		t.Errorf("expected second request to be a cache hit when noHeuristicCaching is disabled, got: %q", state)
+	}
+}
+
+// TestCache_ExplicitCacheControlStillCachedWithNoHeuristicCaching confirms
+// NoHeuristicCaching only blocks the headerless fallback path - a response
+// with an explicit Cache-Control must still be cached normally.
+func TestCache_ExplicitCacheControlStillCachedWithNoHeuristicCaching(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("explicitly cacheable"))
+	}
+
+	cfg := &Config{
+		Path:               dir,
+		MaxExpiry:          10,
+		Cleanup:            20,
+		AddStatusHeader:    true,
+		NoHeuristicCaching: true,
+		MaxHeaderPairs:     5,
+		MaxHeaderKeyLen:    30,
+		MaxHeaderValueLen:  200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/explicit", nil)
+
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, req)
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Fatalf("first request: want \"miss\", got: %q", state)
+	}
+
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, req)
+	if state := rw.Header().Get("Cache-Status"); state != "hit" {
+		t.Errorf("expected second request to be a cache hit (explicit Cache-Control present), got: %q", state)
+	}
+}
+
 func TestCache_VaryHandling(t *testing.T) {
 	tests := []struct {
 		name      string
