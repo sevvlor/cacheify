@@ -41,6 +41,21 @@ func TestNew(t *testing.T) {
 			cfg:     &Config{Path: os.TempDir(), MaxExpiry: 300, Cleanup: 600},
 			wantErr: false,
 		},
+		{
+			name:    "should error if maxHeaderPairs exceeds the on-disk format limit",
+			cfg:     &Config{Path: os.TempDir(), MaxExpiry: 300, Cleanup: 600, MaxHeaderPairs: maxWireHeaderPairs + 1},
+			wantErr: true,
+		},
+		{
+			name:    "should error if maxHeaderKeyLen exceeds the on-disk format limit",
+			cfg:     &Config{Path: os.TempDir(), MaxExpiry: 300, Cleanup: 600, MaxHeaderKeyLen: maxWireHeaderKeyLen + 1},
+			wantErr: true,
+		},
+		{
+			name:    "should error if maxHeaderValueLen exceeds the on-disk format limit",
+			cfg:     &Config{Path: os.TempDir(), MaxExpiry: 300, Cleanup: 600, MaxHeaderValueLen: maxWireHeaderValueLen + 1},
+			wantErr: true,
+		},
 	}
 
 	for _, test := range tests {
@@ -84,6 +99,111 @@ func TestCache_ServeHTTP(t *testing.T) {
 
 	if state := rw.Header().Get("Cache-Status"); state != "hit" {
 		t.Errorf("unexpected cache state: want \"hit\", got: %q", state)
+	}
+}
+
+func TestCache_NoCacheOnSetCookie(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "max-age=20")
+		rw.Header().Set("Set-Cookie", "XSRF-TOKEN=deadbeef; Path=/; Secure; SameSite=Strict")
+		rw.WriteHeader(http.StatusOK)
+	}
+
+	cfg := &Config{
+		Path:               dir,
+		MaxExpiry:          10,
+		Cleanup:            20,
+		AddStatusHeader:    true,
+		NoCacheOnSetCookie: true,
+		MaxHeaderPairs:     5,
+		MaxHeaderKeyLen:    30,
+		MaxHeaderValueLen:  200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/session", nil)
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+
+		if state := rw.Header().Get("Cache-Status"); state != "miss" {
+			t.Errorf("request %d: unexpected cache state: want \"miss\" (Set-Cookie must never be cached), got: %q", i, state)
+		}
+
+		if got := rw.Header().Get("Set-Cookie"); got == "" {
+			t.Errorf("request %d: expected Set-Cookie to be delivered to the client, got none", i)
+		}
+	}
+}
+
+func TestCache_VaryHandling(t *testing.T) {
+	tests := []struct {
+		name      string
+		varyValue string
+		wantCache bool
+	}{
+		{name: "no Vary header", varyValue: "", wantCache: true},
+		{name: "Vary: Accept-Encoding is safelisted", varyValue: "Accept-Encoding", wantCache: true},
+		{name: "Vary: Accept-Encoding, Accept-Language is safelisted", varyValue: "Accept-Encoding, Accept-Language", wantCache: true},
+		{name: "Vary: Cookie must not be cached", varyValue: "Cookie", wantCache: false},
+		{name: "Vary: Authorization must not be cached", varyValue: "Authorization", wantCache: false},
+		{name: "Vary: * must never be cached", varyValue: "*", wantCache: false},
+		{name: "mixed safelisted and unsafe still blocks caching", varyValue: "Accept-Encoding, Cookie", wantCache: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := createTempDir(t)
+
+			next := func(rw http.ResponseWriter, req *http.Request) {
+				rw.Header().Set("Cache-Control", "max-age=20")
+				if test.varyValue != "" {
+					rw.Header().Set("Vary", test.varyValue)
+				}
+				rw.WriteHeader(http.StatusOK)
+			}
+
+			cfg := &Config{
+				Path:              dir,
+				MaxExpiry:         10,
+				Cleanup:           20,
+				AddStatusHeader:   true,
+				MaxHeaderPairs:    5,
+				MaxHeaderKeyLen:   30,
+				MaxHeaderValueLen: 200,
+			}
+
+			c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "http://localhost/vary-test", nil)
+
+			rw := httptest.NewRecorder()
+			c.ServeHTTP(rw, req)
+			if state := rw.Header().Get("Cache-Status"); state != "miss" {
+				t.Fatalf("first request: unexpected cache state: want \"miss\", got: %q", state)
+			}
+
+			rw = httptest.NewRecorder()
+			c.ServeHTTP(rw, req)
+
+			state := rw.Header().Get("Cache-Status")
+			if test.wantCache && state != "hit" {
+				t.Errorf("expected second request to be a cache hit, got: %q", state)
+			}
+			if !test.wantCache && state != "miss" {
+				t.Errorf("expected second request to bypass the cache, got: %q", state)
+			}
+		})
 	}
 }
 

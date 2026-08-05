@@ -79,22 +79,31 @@ This determines whether the query parameters on the url form part of the key use
 #### Max Header Pairs (`maxHeaderPairs`)
 *Default: 255*
 
-The maximum number of header key-value pairs allowed in cached responses. This prevents disk bloat attacks from responses with excessive headers. Multi-value headers (e.g., multiple `Set-Cookie` headers) count as separate pairs.
+The maximum number of header key-value pairs allowed in cached responses. This prevents disk bloat attacks from responses with excessive headers. Multi-value headers (e.g., multiple `Set-Cookie` headers) count as separate pairs. Must not exceed 65535 (the on-disk format uses a 2-byte pair count); values above that are rejected at startup rather than silently truncated.
 
 #### Max Header Key Length (`maxHeaderKeyLen`)
 *Default: 100*
 
-The maximum length in bytes for header keys (names). This prevents disk bloat from maliciously long header names. Standard HTTP header names are typically 10-30 bytes.
+The maximum length in bytes for header keys (names). This prevents disk bloat from maliciously long header names. Standard HTTP header names are typically 10-30 bytes. Must not exceed 65535 (the on-disk format uses a 2-byte key length); values above that are rejected at startup rather than silently truncated.
 
 #### Max Header Value Length (`maxHeaderValueLen`)
 *Default: 8192*
 
-The maximum length in bytes for header values. This prevents disk bloat from oversized cookies, tokens, or other header values. The default allows for large JWTs and session cookies while preventing abuse.
+The maximum length in bytes for header values. This prevents disk bloat from oversized cookies, tokens, or other header values. The default allows for large JWTs and session cookies while preventing abuse. Must not exceed 16777215 (the on-disk format uses a 3-byte value length); values above that are rejected at startup rather than silently truncated.
 
 #### Strip Response Cookies (`stripResponseCookies`)
 *Default: true*
 
-If true (the default) cacheify will remove any 'Set-Cookie' headers from any cacheable responses (including the original request.)
+If true (the default) cacheify will remove any 'Set-Cookie' headers from any cacheable responses (including the original request.) With the default `noCacheOnSetCookie` behaviour, responses carrying `Set-Cookie` are never cached in the first place, so this option mainly matters if you've disabled `noCacheOnSetCookie`.
+
+#### No Cache On Set-Cookie (`noCacheOnSetCookie`)
+*Default: true*
+
+If true (the default), any response carrying a `Set-Cookie` header is treated as unconditionally non-cacheable, regardless of its `Cache-Control` headers - matching Varnish's default `hit_for_pass` behaviour for `Set-Cookie` responses. This exists because origins frequently forget to mark per-session/personalized responses as `private`/`no-store`, and a shared cache that only trusts `Cache-Control` can end up serving one user's cookie-bearing response (and its body) to another user. Disable this only if you are certain every route behind this middleware sets `Cache-Control` correctly for personalized content.
+
+#### Vary Handling
+
+Cacheify's cache key does not incorporate any request headers, so a response whose `Vary` header names anything other than `Accept-Encoding` or `Accept-Language` (or is `Vary: *`) is treated as non-cacheable, regardless of `Cache-Control`. This prevents serving one client's `Vary: Cookie`/`Vary: Authorization` variant to every other client requesting the same URL. This is not currently configurable.
 
 #### Update Timeout (`updateTimeout`)
 *Default: 30*
