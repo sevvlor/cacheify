@@ -133,6 +133,25 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bypass the cache entirely (both read AND write) for Authorization-bearing
+	// requests, matching Varnish's default vcl_recv "return (pass)" behaviour.
+	// This must happen before any cache lookup: a check inside cacheable()
+	// alone only stops an authenticated response from being *written* - an
+	// authenticated request could still receive a *hit* that an earlier,
+	// unauthenticated request for the same URL had already cached, since the
+	// cache key does not incorporate Authorization. That would silently serve
+	// the wrong (generic/anonymous) content to an authenticated caller. Doing
+	// the bypass here also avoids needlessly serialising concurrent
+	// Authorization-bearing requests through the update-intent machinery,
+	// since none of them will ever be cached anyway.
+	if m.cfg.NoCacheOnAuthorization && r.Header.Get("Authorization") != "" {
+		if m.cfg.AddStatusHeader {
+			w.Header().Set(cacheHeader, cacheMissStatus)
+		}
+		m.next.ServeHTTP(w, r)
+		return
+	}
+
 	cs := cacheMissStatus
 
 	key := cacheKey(r, m.cfg.QueryInKey)
@@ -281,17 +300,15 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 		return 0, false
 	}
 
-	// RFC 7234 §3.2 lets a response explicitly re-enable caching of an
-	// Authorization-bearing request via Cache-Control: public/must-revalidate/
-	// s-maxage - the underlying cachecontrol library honours that override.
-	// That is spec-compliant (and matches Varnish's default), but origins
-	// frequently set "public" meaning just "cacheable" without realising it
-	// also overrides this protection - which can leak one bearer token's
-	// response body to a request carrying a different (or no) token at the
-	// same URL. Block it unconditionally unless explicitly disabled.
-	if m.cfg.NoCacheOnAuthorization && r.Header.Get("Authorization") != "" {
-		return 0, false
-	}
+	// NoCacheOnAuthorization is enforced as a full read+write bypass in
+	// ServeHTTP, before a cache lookup even happens - see the comment there.
+	// By the time cacheable() runs (only reachable on a cache miss), an
+	// Authorization-bearing request has therefore already been routed
+	// straight to the backend when the option is enabled, so no check is
+	// needed here. When the option is disabled, RFC 7234 §3.2's
+	// Authorization-request handling in the cachecontrol library below
+	// still applies (Cache-Control: public/must-revalidate/s-maxage
+	// re-enables caching, matching Varnish's default).
 
 	if !varyIsCacheable(w) {
 		return 0, false

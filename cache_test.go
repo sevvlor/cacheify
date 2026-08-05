@@ -223,6 +223,77 @@ func TestCache_AuthorizationCacheableWhenDisabled(t *testing.T) {
 	}
 }
 
+// TestCache_AuthorizationNeverServedFromAnonymousHit guards against a bug where
+// NoCacheOnAuthorization only blocked *writing* an Authorization-bearing
+// response to the cache. Because the cache key never includes the
+// Authorization header, an earlier anonymous request could populate the
+// cache for a URL, and a later Authorization-bearing request for that same
+// URL would then receive that stale anonymous hit directly from GetStream -
+// without ever reaching the write-time check, and without the backend ever
+// seeing the authenticated request at all.
+func TestCache_AuthorizationNeverServedFromAnonymousHit(t *testing.T) {
+	dir := createTempDir(t)
+
+	var backendCalls []string
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		auth := req.Header.Get("Authorization")
+		backendCalls = append(backendCalls, auth)
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		_, _ = rw.Write([]byte("response-for:" + auth))
+	}
+
+	cfg := &Config{
+		Path:                   dir,
+		MaxExpiry:              10,
+		Cleanup:                20,
+		AddStatusHeader:        true,
+		NoCacheOnAuthorization: true,
+		MaxHeaderPairs:         5,
+		MaxHeaderKeyLen:        30,
+		MaxHeaderValueLen:      200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	anonReq := httptest.NewRequest(http.MethodGet, "http://localhost/shared-url", nil)
+
+	// Anonymous request populates the cache.
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, anonReq)
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Fatalf("anonymous request 1: want \"miss\", got: %q", state)
+	}
+
+	// A second anonymous request confirms it's actually cached.
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, anonReq)
+	if state := rw.Header().Get("Cache-Status"); state != "hit" {
+		t.Fatalf("anonymous request 2: want \"hit\", got: %q", state)
+	}
+
+	// An authenticated request to the SAME URL must bypass the cache
+	// entirely - it must never receive the anonymous cached body, and the
+	// backend must see it.
+	authReq := httptest.NewRequest(http.MethodGet, "http://localhost/shared-url", nil)
+	authReq.Header.Set("Authorization", "Bearer secret-token")
+
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, authReq)
+
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Errorf("authenticated request: want \"miss\" (must bypass cache), got: %q", state)
+	}
+	if got, want := rw.Body.String(), "response-for:Bearer secret-token"; got != want {
+		t.Errorf("authenticated request got the stale anonymous cached response instead of its own: got %q, want %q", got, want)
+	}
+	if len(backendCalls) != 2 || backendCalls[1] != "Bearer secret-token" {
+		t.Errorf("expected backend to be called for the authenticated request, backend calls: %v", backendCalls)
+	}
+}
+
 func TestCache_VaryHandling(t *testing.T) {
 	tests := []struct {
 		name      string
