@@ -332,6 +332,28 @@ func varyIsCacheable(w http.ResponseWriter) bool {
 	return true
 }
 
+// hasExplicitFreshness reports whether the origin explicitly said anything
+// about freshness at all: an Expires header, or a Cache-Control public/
+// max-age/s-maxage directive. Deliberately does NOT consult Last-Modified -
+// that only feeds the library's own heuristic-expiry guess, which is exactly
+// what NoHeuristicCaching exists to bypass.
+func hasExplicitFreshness(w http.ResponseWriter) bool {
+	if w.Header().Get("Expires") != "" {
+		return true
+	}
+
+	for _, cc := range w.Header().Values("Cache-Control") {
+		for _, directive := range strings.Split(cc, ",") {
+			d := strings.ToLower(strings.TrimSpace(directive))
+			if d == "public" || strings.HasPrefix(d, "max-age=") || strings.HasPrefix(d, "s-maxage=") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (time.Duration, bool) {
 	// This plugin always replays a cached entry's stored status/body verbatim
 	// to every subsequent request, regardless of that request's own
@@ -380,22 +402,22 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 		return 0, false
 	}
 
-	if expireBy.IsZero() {
-		// No explicit expiration signal (no Cache-Control max-age/s-maxage,
-		// no Public directive, no Expires header) - the response only ended
-		// up here because its status code is heuristically cacheable by
-		// default per RFC 7234 §4.2.2. That default exists for caches that
-		// implement heuristic freshness properly (e.g. deriving a lifetime
-		// from Last-Modified); this plugin instead just applies the flat
-		// MaxExpiry ceiling to anything, including responses whose origin
-		// never made any caching decision at all - i.e. ordinary dynamic
-		// endpoints that simply forgot to set Cache-Control: no-store. With
-		// NoHeuristicCaching enabled, require an explicit signal instead of
-		// guessing.
-		if m.cfg.NoHeuristicCaching {
-			return 0, false
-		}
+	// NoHeuristicCaching must be checked against the raw headers, not
+	// expireBy.IsZero(): the library derives expireBy from TWO independent
+	// heuristics, and expireBy is non-zero (this response looks "explicitly
+	// fresh") as soon as EITHER one applies:
+	//  1. An explicit Cache-Control max-age/s-maxage/public, or Expires.
+	//  2. Apache's heuristic freshness rule - 10% of the time since
+	//     Last-Modified, capped at 24h - which the library applies whenever
+	//     Last-Modified is present, even with zero other cache headers.
+	// (2) is exactly the kind of guessing this option exists to disable, so
+	// requiring "expireBy is non-zero" alone is not sufficient - a response
+	// with nothing but a Last-Modified header would otherwise slip through.
+	if m.cfg.NoHeuristicCaching && !hasExplicitFreshness(w) {
+		return 0, false
+	}
 
+	if expireBy.IsZero() {
 		return time.Duration(m.cfg.MaxExpiry) * time.Second, true
 	}
 

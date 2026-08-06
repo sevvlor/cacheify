@@ -512,6 +512,50 @@ func TestCache_NoHeuristicCaching(t *testing.T) {
 	}
 }
 
+// TestCache_NoHeuristicCaching_LastModifiedAlone guards against a response
+// carrying ONLY a Last-Modified header (no Cache-Control, no Expires) from
+// being cached when NoHeuristicCaching is enabled. The underlying
+// cachecontrol library derives a non-zero expireBy from Last-Modified alone
+// (Apache's "10% of time since last-modified" heuristic), so checking
+// expireBy.IsZero() is not sufficient to detect the absence of an explicit
+// freshness signal - this must be checked against the raw headers instead.
+func TestCache_NoHeuristicCaching_LastModifiedAlone(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "text/javascript")
+		rw.Header().Set("Last-Modified", time.Now().Add(-30*24*time.Hour).Format(http.TimeFormat))
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("console.log('hi')"))
+	}
+
+	cfg := &Config{
+		Path:               dir,
+		MaxExpiry:          10,
+		Cleanup:            20,
+		AddStatusHeader:    true,
+		NoHeuristicCaching: true,
+		MaxHeaderPairs:     5,
+		MaxHeaderKeyLen:    30,
+		MaxHeaderValueLen:  200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/app.js", nil)
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+		if state := rw.Header().Get("Cache-Status"); state != "miss" {
+			t.Errorf("request %d: want \"miss\" (Last-Modified alone must not trigger heuristic caching), got: %q", i, state)
+		}
+	}
+}
+
 // TestCache_HeuristicCachingWhenDisabled confirms disabling NoHeuristicCaching
 // restores the pre-hardening v1.0.0 behaviour of caching a headerless
 // response using MaxExpiry as its heuristic lifetime.
