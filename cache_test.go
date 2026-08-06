@@ -597,6 +597,119 @@ func TestCache_ExplicitCacheControlStillCachedWithNoHeuristicCaching(t *testing.
 	}
 }
 
+// TestCache_OnlyCacheGetAndHead_PostBypassesCache guards against the
+// GraphQL-style scenario: a single POST endpoint that distinguishes requests
+// purely by body. Since cacheify's cache key never incorporates the request
+// body, a POST allowed to be cached (per RFC 7234, when explicit freshness
+// is present) would let a later, different POST body receive the first
+// request's stale response instead of reaching the backend at all.
+func TestCache_OnlyCacheGetAndHead_PostBypassesCache(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		body, _ := ioutil.ReadAll(req.Body)
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("response-for:" + string(body)))
+	}
+
+	cfg := &Config{
+		Path:                dir,
+		MaxExpiry:           10,
+		Cleanup:             20,
+		AddStatusHeader:     true,
+		OnlyCacheGetAndHead: true,
+		MaxHeaderPairs:      5,
+		MaxHeaderKeyLen:     30,
+		MaxHeaderValueLen:   200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	postAlice := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "http://localhost/graphql", strings.NewReader("query-alice"))
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+		return rw
+	}
+	postBob := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "http://localhost/graphql", strings.NewReader("query-bob"))
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+		return rw
+	}
+
+	rw := postAlice()
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Errorf("first POST: want \"miss\" (POST must bypass cache), got: %q", state)
+	}
+	if got, want := rw.Body.String(), "response-for:query-alice"; got != want {
+		t.Errorf("first POST got wrong body: got %q, want %q", got, want)
+	}
+
+	// A second, different POST to the same URL must reach the backend and
+	// get its OWN response - never Alice's cached one.
+	rw = postBob()
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Errorf("second POST: want \"miss\" (must bypass cache, not reuse the first POST's response), got: %q", state)
+	}
+	if got, want := rw.Body.String(), "response-for:query-bob"; got != want {
+		t.Errorf("second POST got the wrong body (likely served Alice's cached response): got %q, want %q", got, want)
+	}
+}
+
+// TestCache_PostCacheableWhenOnlyCacheGetAndHeadDisabled confirms disabling
+// OnlyCacheGetAndHead restores the underlying library's default POST
+// handling (cacheable given explicit freshness), demonstrating the exact
+// risk the option exists to prevent: a second, different POST body to the
+// same URL receives the first POST's stale cached response.
+func TestCache_PostCacheableWhenOnlyCacheGetAndHeadDisabled(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		body, _ := ioutil.ReadAll(req.Body)
+		rw.Header().Set("Cache-Control", "public, max-age=20")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("response-for:" + string(body)))
+	}
+
+	cfg := &Config{
+		Path:                dir,
+		MaxExpiry:           10,
+		Cleanup:             20,
+		AddStatusHeader:     true,
+		OnlyCacheGetAndHead: false,
+		MaxHeaderPairs:      5,
+		MaxHeaderKeyLen:     30,
+		MaxHeaderValueLen:   200,
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aliceReq := httptest.NewRequest(http.MethodPost, "http://localhost/graphql", strings.NewReader("query-alice"))
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, aliceReq)
+	if state := rw.Header().Get("Cache-Status"); state != "miss" {
+		t.Fatalf("first POST: want \"miss\", got: %q", state)
+	}
+
+	bobReq := httptest.NewRequest(http.MethodPost, "http://localhost/graphql", strings.NewReader("query-bob"))
+	rw = httptest.NewRecorder()
+	c.ServeHTTP(rw, bobReq)
+	if state := rw.Header().Get("Cache-Status"); state != "hit" {
+		t.Fatalf("expected second POST to be a cache hit when onlyCacheGetAndHead is disabled, got: %q", state)
+	}
+	if got, want := rw.Body.String(), "response-for:query-alice"; got != want {
+		t.Errorf("expected the (undesirable but library-default) stale cross-request response, got %q, want %q", got, want)
+	}
+}
+
 func TestCache_VaryHandling(t *testing.T) {
 	tests := []struct {
 		name      string

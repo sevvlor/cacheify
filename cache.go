@@ -27,6 +27,7 @@ type Config struct {
 	NoCacheOnSetCookie     bool   `json:"noCacheOnSetCookie" yaml:"noCacheOnSetCookie" toml:"noCacheOnSetCookie"`
 	NoCacheOnAuthorization bool   `json:"noCacheOnAuthorization" yaml:"noCacheOnAuthorization" toml:"noCacheOnAuthorization"`
 	NoHeuristicCaching     bool   `json:"noHeuristicCaching" yaml:"noHeuristicCaching" toml:"noHeuristicCaching"`
+	OnlyCacheGetAndHead    bool   `json:"onlyCacheGetAndHead" yaml:"onlyCacheGetAndHead" toml:"onlyCacheGetAndHead"`
 	MaxHeaderPairs         int    `json:"maxHeaderPairs" yaml:"maxHeaderPairs" toml:"maxHeaderPairs"`
 	MaxHeaderKeyLen        int    `json:"maxHeaderKeyLen" yaml:"maxHeaderKeyLen" toml:"maxHeaderKeyLen"`
 	MaxHeaderValueLen      int    `json:"maxHeaderValueLen" yaml:"maxHeaderValueLen" toml:"maxHeaderValueLen"`
@@ -44,6 +45,7 @@ func CreateConfig() *Config {
 		NoCacheOnSetCookie:     true,
 		NoCacheOnAuthorization: true,
 		NoHeuristicCaching:     true,
+		OnlyCacheGetAndHead:    true,
 		MaxHeaderPairs:         255,
 		MaxHeaderKeyLen:        100,
 		MaxHeaderValueLen:      8192,
@@ -144,6 +146,27 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// or an existing full 200 entry could be served back to a Range request
 	// while completely ignoring the requested range.
 	if r.Header.Get("Range") != "" {
+		if m.cfg.AddStatusHeader {
+			w.Header().Set(cacheHeader, cacheMissStatus)
+		}
+		m.next.ServeHTTP(w, r)
+		return
+	}
+
+	// Bypass the cache entirely (both read AND write) for any method other
+	// than GET/HEAD, matching Varnish's default vcl_recv behaviour ("We only
+	// deal with GET and HEAD by default"). The underlying cachecontrol
+	// library already hard-blocks PUT/DELETE/CONNECT/OPTIONS/TRACE, but it
+	// permits POST when the response carries explicit freshness (Cache-
+	// Control/Expires), per RFC 7234 - a narrow allowance intended for things
+	// like cacheable search results. Cacheify's cache key never incorporates
+	// the request body, so any POST-based API that distinguishes requests by
+	// body rather than URL (most notably GraphQL, which typically serves all
+	// queries and mutations through a single POST endpoint) would have every
+	// distinct request collapse onto the same cache key: the first POST's
+	// response would then be served verbatim to every other POST to that
+	// same URL, regardless of what its body actually asked for.
+	if m.cfg.OnlyCacheGetAndHead && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		if m.cfg.AddStatusHeader {
 			w.Header().Set(cacheHeader, cacheMissStatus)
 		}
